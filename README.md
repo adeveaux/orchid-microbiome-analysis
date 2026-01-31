@@ -20,7 +20,9 @@ orchid-microbiome-code/
 ├── 03_beta_regression_topic_associations.R     # Differential abundance analysis
 ├── session_info.txt                            # R package versions
 ├── data/                                       # Input data directory
-│   └── README.md                               # Data availability information
+│   ├── README.md                               # Data availability information
+│   ├── orchid_metadata_deidentified.csv        # De-identified sample metadata
+│   └── ps_filtered.rds                         # Processed phyloseq object (not included)
 └── results/                                    # Output directory (created by scripts)
 ```
 
@@ -40,7 +42,18 @@ Raw FASTQ files are available from the NCBI Sequence Read Archive:
 - **SRA Study:** SRP[XXXXXX] *(to be added upon data deposition)*
 
 ### Processed Data
-De-identified sample metadata and processed data tables are available in the manuscript supplementary materials.
+De-identified sample metadata and processed data tables are available in the manuscript supplementary materials and this repository.
+
+### Study Metadata
+De-identified sample metadata is available in this repository:
+- **File:** `data/orchid_metadata_deidentified.csv`
+- **Contents:** 
+  - Sample identifiers
+  - Demographic variables (Race_clean, age_clean)
+  - Clinical variables (Stage_clean, Histology_clean)
+  - Sequencing batch information
+  - Exclusion criteria flags (antibiotic use, vaginal product use)
+- **Note:** All personal identifiers have been removed to protect participant privacy. This metadata file corresponds to the 132 samples included in final analyses after quality filtering.
 
 ## Requirements
 
