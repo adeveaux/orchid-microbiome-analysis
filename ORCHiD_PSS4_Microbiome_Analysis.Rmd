@@ -1,0 +1,847 @@
+---
+title: "Perceived Stress and Vaginal *Lactobacillus* Species Among Patients With Ovarian Cancer: Analysis Code"
+subtitle: "ORCHiD study — all analyses, tables, and figures reported in the manuscript"
+author: "April Deveaux"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    number_sections: true
+    theme: flatly
+params:
+  data_dir: "data"
+  output_dir: "analysis_outputs"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 5)
+```
+
+# Purpose and inputs
+
+This document contains the statistical analysis for the manuscript *Perceived
+Stress and Vaginal Lactobacillus Species Among Patients With Ovarian Cancer in
+the ORCHiD Study*, including all tables, figures, and Supplementary Table S1.
+
+**Scope.** The analysis starts from **prepared analysis datasets**. It does not
+process sequencing data and does not derive the microbiome measures. The
+following are produced upstream and are read here as columns:
+
+- 16S rRNA processing (DADA2, SILVA taxonomy), species assignment, and relative
+  abundances;
+- Shannon diversity (ASV level);
+- the *Lactobacillus* dominance indicator (genus relative abundance ≥ 50%);
+- the species detection indicators (species-assigned relative abundance > 0) and
+  *L. iners* relative abundance;
+- the latent Dirichlet allocation topic model from the parent ORCHiD analysis;
+- the PSS-4 total score and registry-derived stage and histologic subtype
+  categories.
+
+**What this file does.** It reads the prepared files, standardizes PSS-4 to a
+z-score, builds the analysis factors and binary outcome variables, identifies the
+*Lactobacillus*-dominated topic, fits every model reported in the manuscript,
+generates Tables 1–3, Supplementary Table S1 and Figures 1–2, and writes them to
+disk so no reported value is copied by hand.
+
+**Required input files** (placed in `params$data_dir`; set the parameter when
+knitting, e.g. `rmarkdown::render("ORCHiD_PSS4_Lactobacillus_Analysis.Rmd",
+params = list(data_dir = "path/to/data"))`):
+
+| File | Prepared columns used |
+|---|---|
+| `complete_stress_dysbiosis_dataset.csv` | One row per analytic participant: `SampleID`; `pss4_sum` (PSS-4 total, 0–16); `age` (or `age.x`); `race_clean` (`NH-White`/`NH-Black`); `stage_clean` (`Early`/`Late`); `hist_clean` (`Type I + Other`/`Type II`); `shannon_diversity` (ASV-level Shannon index); `lactobacillus_dominance` (indicator, genus relative abundance ≥ 50%) |
+| `final_species_enhanced_dataset.csv` | `SampleID`; `crispatus_detected`, `iners_detected`, `gasseri_detected`, `jensenii_detected` (indicators, species-assigned relative abundance > 0); `iners_abundance` (*L. iners* relative abundance, 0–1) |
+| `topic_model_results.rds` | Output of the latent Dirichlet allocation fit in the parent ORCHiD analysis; list element `gamma` with columns `document` (= `SampleID`), `topic`, `gamma` |
+
+**Where each manuscript item is produced**
+
+| Manuscript item | Section |
+|---|---|
+| Table 1 | [Table 1](#table1) |
+| Table 2, Figure 1 | [Species detection](#species), [Community and genus measures](#comparators), [Table 2 and Figure 1](#table2) |
+| Table 3, Figure 2 | [Race interaction and stratified models](#race) |
+| Supplementary Table S1 | [Sensitivity analyses](#sensitivity) |
+
+## Analysis plan
+
+**Exposure.** PSS-4 total score standardized to mean 0, SD 1 (`pss4_z`) in the
+analytic sample and modeled continuously. Every estimate is per 1-SD increase in
+PSS-4 (3.43 points).
+
+**Outcomes.**
+
+| Role | Outcome | Model | Adjustment |
+|---|---|---|---|
+| Species (one correction family) | Detection of *L. crispatus*, *L. iners*, *L. gasseri*, *L. jensenii* (supplied indicators; species-assigned relative abundance > 0) | Firth logistic | race, age |
+| Community / genus | Shannon diversity | Linear regression | race, age, stage, histologic subtype |
+| | *Lactobacillus* dominance (supplied indicator; genus relative abundance ≥ 50%) | Firth logistic | race, age, stage, histologic subtype |
+| | *Lactobacillus*-dominated topic membership | Beta regression, logit link | race, age, stage, histologic subtype |
+| Race | Shannon diversity, *Lactobacillus* dominance | Interaction model (`pss4_z * race + age`) and age-adjusted models within each racial group | age |
+
+**Multiple testing.** Benjamini–Hochberg false discovery rate correction is
+applied across the four species-detection tests only (q < 0.05). Community,
+genus, race, and sensitivity analyses are reported with unadjusted P values.
+
+---
+
+# Packages
+
+```{r packages}
+required_packages <- c("tidyverse", "broom", "logistf", "betareg", "splines", "patchwork")
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0) {
+  stop("Install before knitting: ", paste(missing_packages, collapse = ", "))
+}
+
+library(tidyverse)
+library(broom)
+library(logistf)    # Firth penalized logistic regression
+library(betareg)    # beta regression for topic membership
+library(splines)    # natural cubic spline for the linearity check
+library(patchwork)  # combines figure panels
+
+set.seed(243)
+
+cat(R.version.string, "\n")
+cat("logistf", as.character(packageVersion("logistf")),
+    "| betareg", as.character(packageVersion("betareg")), "\n")
+```
+
+---
+
+# Data
+
+```{r load}
+data_dir <- params$data_dir
+
+read_input <- function(filename) {
+  path <- file.path(data_dir, filename)
+  if (!file.exists(path)) stop("Input file not found: ", path)
+  path
+}
+
+standardize_age_name <- function(df) {
+  if ("age"   %in% names(df)) return(df)
+  if ("age.x" %in% names(df)) return(dplyr::rename(df, age = age.x))
+  stop("No age or age.x column found.")
+}
+
+to_binary <- function(x, positive = c("yes", "true", "1")) {
+  if (is.logical(x)) return(as.integer(x))
+  if (is.numeric(x)) return(as.integer(x > 0))
+  as.integer(stringr::str_to_lower(stringr::str_trim(as.character(x))) %in% positive)
+}
+
+stress_raw  <- readr::read_csv(read_input("complete_stress_dysbiosis_dataset.csv"),
+                               show_col_types = FALSE) |> standardize_age_name()
+species_raw <- readr::read_csv(read_input("final_species_enhanced_dataset.csv"),
+                               show_col_types = FALSE)
+
+for (nm in c("stress_raw", "species_raw")) {
+  if (anyDuplicated(get(nm)$SampleID)) stop("Duplicate SampleID in ", nm)
+}
+```
+
+```{r species-columns}
+species_map <- c(
+  "L. crispatus" = "crispatus_detected",
+  "L. iners"     = "iners_detected",
+  "L. gasseri"   = "gasseri_detected",
+  "L. jensenii"  = "jensenii_detected"
+)
+
+missing_cols <- setdiff(c(unname(species_map), "iners_abundance"), names(species_raw))
+if (length(missing_cols) > 0) {
+  stop("Species columns not found: ", paste(missing_cols, collapse = ", "),
+       "\nEdit `species_map` to match names(species_raw).")
+}
+```
+
+```{r analytic-data}
+dat <- stress_raw |>
+  mutate(
+    pss4_z = as.numeric(scale(pss4_sum)),
+    race   = factor(race_clean,  levels = c("NH-White", "NH-Black")),
+    stage  = factor(stage_clean, levels = c("Early", "Late")),
+    hist   = factor(hist_clean,  levels = c("Type I + Other", "Type II")),
+    lactobacillus_dominance = to_binary(lactobacillus_dominance)
+  )
+
+species_outcomes <- species_raw |>
+  transmute(
+    SampleID,
+    crispatus_detected = to_binary(.data[[species_map[["L. crispatus"]]]]),
+    iners_detected     = to_binary(.data[[species_map[["L. iners"]]]]),
+    gasseri_detected   = to_binary(.data[[species_map[["L. gasseri"]]]]),
+    jensenii_detected  = to_binary(.data[[species_map[["L. jensenii"]]]]),
+    iners_abundance    = as.numeric(iners_abundance)
+  )
+
+# PSS-4 is standardized once, in `dat`, and carried into `spec` by SampleID so
+# that every model uses the same z-score.
+spec <- dat |>
+  select(SampleID, pss4_sum, pss4_z, race, age, stage, hist) |>
+  inner_join(species_outcomes, by = "SampleID")
+
+species_vars <- c("crispatus_detected", "iners_detected",
+                  "gasseri_detected",   "jensenii_detected")
+
+species_labels <- c(
+  crispatus_detected = "L. crispatus detection",
+  iners_detected     = "L. iners detection",
+  gasseri_detected   = "L. gasseri detection",
+  jensenii_detected  = "L. jensenii detection"
+)
+
+stopifnot(all(c("shannon_diversity", "lactobacillus_dominance") %in% names(dat)))
+stopifnot(nrow(spec) == nrow(dat))
+if (nrow(dat) != 123) warning("Analytic sample has ", nrow(dat),
+                              " rows; the manuscript analytic sample is 123.")
+
+cat("Analytic N:", nrow(dat), "\n")
+cat("PSS-4 mean (SD):", round(mean(dat$pss4_sum), 2),
+    "(", round(sd(dat$pss4_sum), 2), ") | 1-SD =", round(sd(dat$pss4_sum), 2), "points\n")
+```
+
+## Event counts
+
+Event counts determine which adjustment set each outcome can support and make
+sparse or empty cells visible before modeling.
+
+```{r event-counts}
+analysis_counts <- bind_rows(
+  tibble(outcome = "Shannon diversity",
+         analytic_n = sum(complete.cases(dat[c("shannon_diversity", "pss4_z",
+                                               "race", "age", "stage", "hist")])),
+         events = NA_integer_),
+  tibble(outcome = "Lactobacillus dominance (>=50%)",
+         analytic_n = nrow(dat),
+         events = sum(dat$lactobacillus_dominance == 1, na.rm = TRUE)),
+  map_dfr(species_vars, \(v) tibble(
+    outcome    = unname(species_labels[v]),
+    analytic_n = nrow(spec),
+    events     = sum(spec[[v]] == 1, na.rm = TRUE)
+  ))
+)
+analysis_counts
+
+for (v in species_vars) {
+  cat("\n", unname(species_labels[v]), " by race:\n", sep = "")
+  print(table(Race = spec$race, Detected = spec[[v]]))
+}
+```
+
+*L. crispatus* is detected only among NH-White participants (a zero cell), which
+is one reason Firth penalized regression is used: ordinary logistic regression
+cannot return a finite estimate under separation.
+
+---
+
+# Helper functions
+
+These extract one term from a fitted model into a table-ready row. The `.env`
+and `.data` pronouns are deliberate: `broom::tidy()` returns a numeric column
+named `statistic`, which `dplyr` can otherwise confuse with the label argument.
+
+```{r helpers}
+extract_lm_term <- function(model, term, outcome, adjustment, statistic = "Beta") {
+  broom::tidy(model, conf.int = TRUE) |>
+    filter(.data$term == .env$term) |>
+    transmute(outcome = .env$outcome, statistic = .env$statistic,
+              estimate = .data$estimate, conf_low = .data$conf.low,
+              conf_high = .data$conf.high, p_value = .data$p.value,
+              adjustment = .env$adjustment)
+}
+
+# Firth models: profile penalized-likelihood confidence intervals and
+# penalized likelihood-ratio P values (the logistf defaults).
+extract_firth_term <- function(model, term, outcome, adjustment, statistic = "OR") {
+  index <- match(term, names(coef(model)))
+  if (is.na(index)) stop("Term not found in Firth model: ", term)
+  tibble(outcome = as.character(outcome), statistic = as.character(statistic),
+         estimate  = as.numeric(exp(coef(model)[index])),
+         conf_low  = as.numeric(exp(model$ci.lower[index])),
+         conf_high = as.numeric(exp(model$ci.upper[index])),
+         p_value   = as.numeric(model$prob[index]),
+         adjustment = as.character(adjustment))
+}
+
+format_result <- function(estimate, conf_low, conf_high, digits = 2) {
+  paste0(formatC(estimate,  format = "f", digits = digits), " (",
+         formatC(conf_low,  format = "f", digits = digits), ", ",
+         formatC(conf_high, format = "f", digits = digits), ")")
+}
+```
+
+---
+
+# Table 1 — participant characteristics {#table1}
+
+Two-sample t tests for continuous variables and Fisher exact tests for
+categorical variables, comparing NH-White and NH-Black participants.
+
+```{r table1}
+t1_continuous <- function(d, var, label) {
+  tt <- stats::t.test(stats::as.formula(paste(var, "~ race")), data = d)
+  ms <- function(x) sprintf("%.1f (%.1f)", mean(x, na.rm = TRUE), sd(x, na.rm = TRUE))
+  tibble(characteristic = label,
+         overall  = ms(d[[var]]),
+         nh_white = ms(d[[var]][d$race == "NH-White"]),
+         nh_black = ms(d[[var]][d$race == "NH-Black"]),
+         p_value  = sprintf("%.3f", tt$p.value))
+}
+
+t1_binary <- function(d, var, label) {
+  ft  <- stats::fisher.test(table(d$race, d[[var]]))
+  pct <- function(x) sprintf("%d (%.1f)", sum(x == 1, na.rm = TRUE),
+                             100 * mean(x == 1, na.rm = TRUE))
+  tibble(characteristic = label,
+         overall  = pct(d[[var]]),
+         nh_white = pct(d[[var]][d$race == "NH-White"]),
+         nh_black = pct(d[[var]][d$race == "NH-Black"]),
+         p_value  = sprintf("%.3f", ft$p.value))
+}
+
+t1_dat <- dat |>
+  left_join(spec |> select(SampleID, all_of(species_vars)), by = "SampleID") |>
+  mutate(late_stage = as.integer(stage == "Late"),
+         type_ii    = as.integer(hist  == "Type II"))
+
+table1 <- bind_rows(
+  t1_continuous(t1_dat, "age",                     "Age at diagnosis, mean (SD), years"),
+  t1_binary(    t1_dat, "late_stage",              "Late-stage disease"),
+  t1_binary(    t1_dat, "type_ii",                 "Type II epithelial histology"),
+  t1_continuous(t1_dat, "pss4_sum",                "PSS-4, mean (SD)"),
+  t1_continuous(t1_dat, "shannon_diversity",       "Shannon diversity, mean (SD)"),
+  t1_binary(    t1_dat, "lactobacillus_dominance", "Lactobacillus dominance"),
+  t1_binary(    t1_dat, "crispatus_detected",      "L. crispatus detected"),
+  t1_binary(    t1_dat, "iners_detected",          "L. iners detected"),
+  t1_binary(    t1_dat, "gasseri_detected",        "L. gasseri detected"),
+  t1_binary(    t1_dat, "jensenii_detected",       "L. jensenii detected")
+)
+
+cat("N overall:", nrow(t1_dat),
+    "| NH-White:", sum(t1_dat$race == "NH-White"),
+    "| NH-Black:", sum(t1_dat$race == "NH-Black"), "\n")
+cat("PSS-4 range:", min(dat$pss4_sum), "-", max(dat$pss4_sum),
+    "| participants scoring 0:", sum(dat$pss4_sum == 0),
+    sprintf("(%.1f%%)", 100 * mean(dat$pss4_sum == 0)), "\n\n")
+table1
+```
+
+---
+
+# Species detection {#species}
+
+**Question.** Is perceived stress associated with detection of each of the four
+predominant vaginal *Lactobacillus* species?
+
+**Model.** Firth penalized logistic regression adjusted for race and age.
+Detection is binary; event counts are small (6–14) and one species is detected
+in only one racial group, so penalization keeps estimates finite. Confidence
+intervals are profile penalized-likelihood intervals. Only race and age are
+included because additional covariates cannot be supported by 6–14 events. All
+four species are fit in one loop with one formula so the four tests share a
+specification.
+
+**Multiple testing.** Benjamini–Hochberg correction across these four P values.
+
+```{r species-primary}
+species_results <- map_dfr(species_vars, function(v) {
+  model <- logistf(as.formula(paste(v, "~ pss4_z + race + age")), data = spec)
+  extract_firth_term(model, term = "pss4_z",
+                     outcome    = unname(species_labels[v]),
+                     adjustment = "Race and age", statistic = "OR") |>
+    mutate(events = sum(spec[[v]] == 1, na.rm = TRUE))
+}) |>
+  mutate(fdr_q       = p.adjust(p_value, method = "BH"),
+         estimate_ci = format_result(estimate, conf_low, conf_high)) |>
+  select(outcome, statistic, estimate, conf_low, conf_high,
+         estimate_ci, p_value, fdr_q, events, adjustment)
+
+species_results
+```
+
+---
+
+# Community and genus measures {#comparators}
+
+Each is a different construct and is reported once with an unadjusted P value.
+All three models are adjusted for race, age, stage, and histologic subtype.
+
+## Shannon diversity
+
+Linear regression; the outcome is continuous. Shannon diversity is calculated at
+the amplicon sequence variant level.
+
+```{r shannon}
+m_shannon <- lm(shannon_diversity ~ pss4_z + race + age + stage + hist, data = dat)
+
+shannon_result <- extract_lm_term(
+  m_shannon, term = "pss4_z", outcome = "Shannon diversity",
+  adjustment = "Race, age, stage, and histologic subtype", statistic = "Beta")
+shannon_result
+```
+
+## *Lactobacillus* dominance
+
+Dominance is supplied as an indicator of genus-level *Lactobacillus* relative
+abundance of at least 50% (29 of 123 participants). Firth penalized logistic regression is used for all
+binary outcomes so that a single estimator is applied throughout.
+
+```{r dominance}
+m_dom <- logistf(lactobacillus_dominance ~ pss4_z + race + age + stage + hist,
+                 data = dat)
+
+dominance_result <- extract_firth_term(
+  m_dom, term = "pss4_z", outcome = "Lactobacillus dominance",
+  adjustment = "Race, age, stage, and histologic subtype", statistic = "OR")
+dominance_result
+```
+
+## *Lactobacillus*-dominated topic
+
+Topics come from the latent Dirichlet allocation fit in the parent ORCHiD
+analysis (seven topics). Topic numbering is not stable across fits, so the
+*Lactobacillus*-dominated topic is identified as the topic with the highest mean
+membership proportion (gamma) among *Lactobacillus*-dominant samples rather than
+by a hard-coded number.
+
+Membership is a proportion bounded by 0 and 1, so it is modeled with beta
+regression and a logit link; the coefficient is exponentiated and is the ratio
+of the odds μ/(1−μ) of expected membership per 1-SD increase in PSS-4. Beta
+regression requires values strictly inside (0, 1); the chunk stops if any
+membership proportion is exactly 0 or 1.
+
+```{r topic}
+topic_obj <- readr::read_rds(read_input("topic_model_results.rds"))
+
+gamma_wide <- topic_obj$gamma |>
+  mutate(topic_label = paste0("Topic", topic)) |>
+  select(document, topic_label, gamma) |>
+  pivot_wider(names_from = topic_label, values_from = gamma) |>
+  rename(SampleID = document)
+
+topic_cols <- grep("^Topic", names(gamma_wide), value = TRUE)
+
+beta_dat <- dat |> inner_join(gamma_wide, by = "SampleID")
+stopifnot(nrow(beta_dat) == nrow(dat))
+
+mean_gamma <- colMeans(beta_dat |> filter(lactobacillus_dominance == 1) |>
+                         select(all_of(topic_cols)), na.rm = TRUE)
+cat("Mean membership per topic among Lactobacillus-dominant samples:\n")
+print(round(mean_gamma, 3))
+
+lacto_topic <- names(mean_gamma)[which.max(mean_gamma)]
+cat("\nLactobacillus-dominated topic:", lacto_topic, "\n")
+
+rng <- range(beta_dat[[lacto_topic]])
+cat("Membership range:", signif(rng, 3), "\n")
+if (rng[1] <= 0 || rng[2] >= 1) {
+  stop("Topic membership includes exact 0 or 1; beta regression requires a ",
+       "transformation that is not part of the reported analysis.")
+}
+
+beta_dat$topic_y <- beta_dat[[lacto_topic]]
+m_topic <- betareg(topic_y ~ pss4_z + race + age + stage + hist,
+                   data = beta_dat, link = "logit")
+
+topic_ci <- confint(m_topic)["pss4_z", ]
+topic_result <- tibble(
+  outcome    = "Lactobacillus-dominated topic membership",
+  statistic  = "exp(Beta)",
+  estimate   = exp(coef(m_topic)[["pss4_z"]]),
+  conf_low   = exp(topic_ci[[1]]),
+  conf_high  = exp(topic_ci[[2]]),
+  p_value    = summary(m_topic)$coefficients$mean["pss4_z", "Pr(>|z|)"],
+  adjustment = "Race, age, stage, and histologic subtype"
+)
+topic_result
+```
+
+---
+
+# Table 2 and Figure 1 {#table2}
+
+```{r table2}
+comparator_results <- bind_rows(shannon_result, dominance_result, topic_result) |>
+  mutate(estimate_ci = format_result(estimate, conf_low, conf_high)) |>
+  select(outcome, statistic, estimate, conf_low, conf_high,
+         estimate_ci, p_value, adjustment)
+
+table2 <- bind_rows(
+  species_results |> select(outcome, events, statistic, estimate, conf_low,
+                            conf_high, p_value, fdr_q, adjustment),
+  comparator_results |>
+    left_join(analysis_counts |> select(outcome, events) |>
+                mutate(outcome = recode(outcome,
+                  "Lactobacillus dominance (>=50%)" = "Lactobacillus dominance")),
+              by = "outcome") |>
+    mutate(fdr_q = NA_real_) |>
+    select(outcome, events, statistic, estimate, conf_low, conf_high,
+           p_value, fdr_q, adjustment)
+)
+table2
+```
+
+**Figure 1.** Panel a: odds ratios (the topic estimate is exp[β]) on a log scale
+for species detection, dominance, and topic membership, with event counts and q
+values. Panel b: the Shannon diversity coefficient on its own linear scale,
+because it is a different quantity.
+
+```{r figure1, fig.width=9, fig.height=6.5}
+col_blue <- "#2166A8"; col_red <- "#BF4A14"
+minus <- function(x) gsub("-", "\u2212", x, fixed = TRUE)
+
+fig1_a_dat <- table2 |>
+  filter(outcome != "Shannon diversity") |>
+  mutate(label  = ifelse(is.na(events), outcome, paste0(outcome, " (", events, ")")),
+         label  = fct_rev(fct_inorder(label)),
+         est_ci = minus(sprintf("%.2f (%.2f\u2013%.2f)", estimate, conf_low, conf_high)),
+         q_txt  = ifelse(is.na(fdr_q), "", sprintf("%.3f", fdr_q)))
+
+fig1_a <- ggplot(fig1_a_dat, aes(x = estimate, y = label)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_errorbar(aes(xmin = conf_low, xmax = conf_high), orientation = "y",
+                width = 0.25, colour = col_blue, linewidth = 0.6) +
+  geom_point(size = 3.2, shape = 16, colour = col_blue) +
+  geom_text(aes(x = 6, label = est_ci), hjust = 0, size = 3.4) +
+  geom_text(aes(x = 17, label = q_txt), hjust = 0, size = 3.4) +
+  annotate("text", x = 6,  y = nrow(fig1_a_dat) + 0.8, label = "Estimate (95% CI)",
+           hjust = 0, size = 3.6) +
+  annotate("text", x = 17, y = nrow(fig1_a_dat) + 0.8, label = "q", hjust = 0, size = 3.6) +
+  scale_x_log10(breaks = c(0.25, 0.5, 1, 2, 4)) +
+  coord_cartesian(clip = "off", xlim = c(0.2, 4), ylim = c(0.6, nrow(fig1_a_dat) + 0.4)) +
+  labs(x = "OR (topic: exp[\u03b2]) per 1-SD increase in PSS-4", y = NULL) +
+  theme_classic(base_size = 11) +
+  theme(axis.line.y = element_blank(), axis.ticks.y = element_blank(),
+        plot.margin = margin(14, 150, 4, 4))
+
+fig1_b_dat <- table2 |>
+  filter(outcome == "Shannon diversity") |>
+  mutate(est_ci = minus(sprintf("%.2f (%.2f to %.2f)", estimate, conf_low, conf_high)))
+
+fig1_b <- ggplot(fig1_b_dat, aes(x = estimate, y = outcome)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_errorbar(aes(xmin = conf_low, xmax = conf_high), orientation = "y",
+                width = 0.25, colour = col_blue, linewidth = 0.6) +
+  geom_point(size = 3.2, shape = 16, colour = col_blue) +
+  geom_text(aes(x = 0.75, label = est_ci), hjust = 0, size = 3.4) +
+  scale_x_continuous(breaks = c(-0.6, 0, 0.6)) +
+  coord_cartesian(clip = "off", xlim = c(-0.6, 0.6)) +
+  labs(x = "\u03b2 per 1-SD increase in PSS-4", y = NULL) +
+  theme_classic(base_size = 11) +
+  theme(axis.line.y = element_blank(), axis.ticks.y = element_blank(),
+        plot.margin = margin(4, 150, 4, 4))
+
+figure1 <- fig1_a / fig1_b + plot_layout(heights = c(6, 1.4)) +
+  plot_annotation(tag_levels = "a")
+figure1
+```
+
+---
+
+# Race interaction and stratified models {#race}
+
+**Question.** Does the PSS-4 association with Shannon diversity or *Lactobacillus*
+dominance differ between NH-Black (n = 20) and NH-White (n = 103) participants?
+
+Two different analyses are run for the same two outcomes:
+
+1. **Interaction models** (`pss4_z * race + age`) formally test whether the PSS-4
+   slope differs between racial groups. The interaction coefficient is the
+   NH-Black minus NH-White difference in slopes (for dominance, exponentiated:
+   the ratio of the two groups' odds ratios).
+2. **Stratified models** (`pss4_z + age`, fit separately within each group)
+   describe the association within each group. They do **not** test whether the
+   groups differ.
+
+Models are adjusted for age only, to preserve degrees of freedom in the
+20-participant stratum. Interaction and stratified models are not fit for
+species-level outcomes (4 *L. iners* detections among NH-Black participants) or
+for topic membership.
+
+```{r race-interaction}
+shannon_int_result <- extract_lm_term(
+  lm(shannon_diversity ~ pss4_z * race + age, data = dat),
+  term = "pss4_z:raceNH-Black", outcome = "Shannon diversity",
+  adjustment = "Age", statistic = "Interaction beta")
+
+dominance_int_result <- extract_firth_term(
+  logistf(lactobacillus_dominance ~ pss4_z * race + age, data = dat),
+  term = "pss4_z:raceNH-Black", outcome = "Lactobacillus dominance",
+  adjustment = "Age", statistic = "Interaction OR")
+
+interaction_results <- bind_rows(shannon_int_result, dominance_int_result) |>
+  mutate(estimate_ci = format_result(estimate, conf_low, conf_high, digits = 3))
+interaction_results
+```
+
+```{r race-stratified}
+shannon_stratified <- dat |>
+  group_split(race) |>
+  set_names(levels(dat$race)) |>
+  map_dfr(function(df) {
+    broom::tidy(lm(shannon_diversity ~ pss4_z + age, data = df), conf.int = TRUE) |>
+      filter(term == "pss4_z") |>
+      transmute(statistic = "Beta", estimate,
+                conf_low = conf.low, conf_high = conf.high, p_value = p.value)
+  }, .id = "race") |>
+  mutate(outcome = "Shannon diversity", .after = race)
+
+dominance_stratified <- dat |>
+  group_split(race) |>
+  set_names(levels(dat$race)) |>
+  map_dfr(function(df) {
+    extract_firth_term(logistf(lactobacillus_dominance ~ pss4_z + age, data = df),
+                       "pss4_z", "Lactobacillus dominance", "Age", "OR") |>
+      select(statistic, estimate, conf_low, conf_high, p_value)
+  }, .id = "race") |>
+  mutate(outcome = "Lactobacillus dominance", .after = race)
+
+stratified_results <- bind_rows(shannon_stratified, dominance_stratified) |>
+  mutate(n = ifelse(race == "NH-White", sum(dat$race == "NH-White"),
+                    sum(dat$race == "NH-Black")), .after = race,
+         estimate_ci = format_result(estimate, conf_low, conf_high))
+stratified_results
+```
+
+**Figure 2.** Race-stratified estimates, with the interaction P value from the
+interaction models above. Circles are NH-White participants and squares are
+NH-Black participants. Panel a: Shannon diversity, linear scale (null = 0).
+Panel b: *Lactobacillus* dominance, odds ratio on a log scale (null = 1).
+
+```{r figure2, fig.width=10, fig.height=5}
+race_labels <- c("NH-White" = paste0("Non-Hispanic White (n=", sum(dat$race == "NH-White"), ")"),
+                 "NH-Black" = paste0("Non-Hispanic Black (n=", sum(dat$race == "NH-Black"), ")"))
+
+fig2_dat <- stratified_results |>
+  mutate(race   = factor(race, levels = c("NH-Black", "NH-White")),
+         est_ci = minus(ifelse(statistic == "Beta",
+                               sprintf("%.2f (%.2f to %.2f)", estimate, conf_low, conf_high),
+                               sprintf("%.2f (%.2f\u2013%.2f)", estimate, conf_low, conf_high))))
+
+fig2_panel <- function(outcome_name, null_value, xlab, p_int, log_scale = FALSE,
+                       limits = NULL, breaks = waiver()) {
+  d <- fig2_dat |> filter(outcome == outcome_name)
+  g <- ggplot(d, aes(x = estimate, y = race, colour = race, shape = race)) +
+    geom_vline(xintercept = null_value, linetype = "dashed", colour = "grey50") +
+    geom_errorbar(aes(xmin = conf_low, xmax = conf_high), orientation = "y",
+                  width = 0.12, linewidth = 0.6) +
+    geom_point(size = 3.6) +
+    geom_text(aes(x = if (log_scale) sqrt(prod(limits)) else mean(limits),
+                  label = est_ci), vjust = -1.6, colour = "black", size = 3.5) +
+    scale_colour_manual(values = c("NH-White" = col_blue, "NH-Black" = col_red),
+                        labels = race_labels, breaks = c("NH-White", "NH-Black")) +
+    scale_shape_manual(values = c("NH-White" = 16, "NH-Black" = 15),   # circle, square
+                       labels = race_labels, breaks = c("NH-White", "NH-Black")) +
+    labs(x = paste0(xlab, "\nInteraction P=", sprintf("%.3f", p_int)), y = NULL,
+         colour = NULL, shape = NULL) +
+    theme_classic(base_size = 11) +
+    theme(axis.line.y = element_blank(), axis.ticks.y = element_blank(),
+          axis.text.y = element_blank(), legend.position = "top")
+  if (log_scale) g <- g + scale_x_log10(breaks = breaks)
+  else g <- g + scale_x_continuous(breaks = breaks)
+  g <- g + coord_cartesian(xlim = limits)   # zoom only; never drops CI endpoints
+  g
+}
+
+fig2_a <- fig2_panel("Shannon diversity", 0, "\u03b2 per 1-SD increase in PSS-4",
+                     interaction_results$p_value[1], limits = c(-1, 0.5),
+                     breaks = c(-1, -0.5, 0, 0.5))
+fig2_b <- fig2_panel("Lactobacillus dominance", 1, "Odds ratio per 1-SD increase in PSS-4",
+                     interaction_results$p_value[2], log_scale = TRUE,
+                     limits = c(0.5, 6), breaks = c(0.5, 1, 2, 4))
+
+figure2 <- (fig2_a + fig2_b) +
+  plot_layout(guides = "collect") + plot_annotation(tag_levels = "a") &
+  theme(legend.position = "top")
+figure2
+```
+
+```{r table3}
+table3 <- bind_rows(
+  interaction_results |> mutate(panel = "Interaction", race = NA_character_, n = NA_integer_),
+  stratified_results  |> mutate(panel = "Race-stratified")
+) |>
+  select(panel, outcome, race, n, statistic, estimate, conf_low, conf_high, p_value)
+table3
+```
+
+---
+
+# Sensitivity analyses {#sensitivity}
+
+None is corrected for multiple testing; each re-expresses a result reported
+above. Together they form Supplementary Table S1.
+
+## Expanded adjustment (species models)
+
+Stage and histologic subtype are added to the four species models to check
+whether the estimates depend on clinical covariates.
+
+```{r sens-expanded}
+species_expanded <- map_dfr(species_vars, function(v) {
+  m <- logistf(as.formula(paste(v, "~ pss4_z + race + age + stage + hist")),
+               data = spec)
+  extract_firth_term(m, "pss4_z", unname(species_labels[v]),
+                     "Race, age, stage, and histologic subtype", "OR")
+}) |>
+  mutate(estimate_ci = format_result(estimate, conf_low, conf_high))
+species_expanded
+```
+
+## Omitting histologic subtype (Shannon diversity and dominance)
+
+Histologic subtype creates the sparsest covariate cells; this checks whether the
+Shannon diversity and dominance estimates depend on its inclusion.
+
+```{r sens-nohist}
+nohist_results <- bind_rows(
+  extract_lm_term(lm(shannon_diversity ~ pss4_z + race + age + stage, data = dat),
+                  "pss4_z", "Shannon diversity", "Race, age, and stage", "Beta"),
+  extract_firth_term(logistf(lactobacillus_dominance ~ pss4_z + race + age + stage,
+                             data = dat),
+                     "pss4_z", "Lactobacillus dominance", "Race, age, and stage", "OR")
+) |>
+  mutate(estimate_ci = format_result(estimate, conf_low, conf_high))
+nohist_results
+```
+
+## Dose–response among *L. iners* carriers
+
+Spearman rank correlation between PSS-4 and *L. iners* relative abundance among
+participants with *L. iners* detected. With 14 observations this is a direction
+check only.
+
+```{r sens-spearman}
+iners_positive <- spec |> filter(iners_abundance > 0)
+sp <- cor.test(iners_positive$pss4_sum, iners_positive$iners_abundance,
+               method = "spearman", exact = FALSE)
+
+spearman_result <- tibble(
+  analysis = "PSS-4 and L. iners abundance among detected samples",
+  n = nrow(iners_positive), rho = unname(sp$estimate), p_value = sp$p.value)
+spearman_result
+```
+
+## Leave-one-out stability
+
+The *L. iners* detection model is refit 123 times, omitting one participant each
+time, to check that no single participant carries the association.
+
+```{r sens-loo}
+leave_one_out_firth <- function(data, formula, term = "pss4_z") {
+  map_dfr(seq_len(nrow(data)), function(i) {
+    fit <- tryCatch(logistf(formula, data = data[-i, , drop = FALSE]),
+                    error = function(e) NULL)
+    if (is.null(fit) || !term %in% names(coef(fit))) {
+      return(tibble(removed_row = i, OR = NA_real_, ci_low = NA_real_))
+    }
+    idx <- match(term, names(coef(fit)))
+    tibble(removed_row = i, OR = exp(coef(fit)[[term]]), ci_low = exp(fit$ci.lower[idx]))
+  })
+}
+
+loo_iners <- leave_one_out_firth(spec, iners_detected ~ pss4_z + race + age)
+
+loo_summary <- tibble(
+  model = "L. iners detection", n_refits = nrow(loo_iners),
+  or_min = min(loo_iners$OR, na.rm = TRUE), or_median = median(loo_iners$OR, na.rm = TRUE),
+  or_max = max(loo_iners$OR, na.rm = TRUE),
+  refits_ci_above1 = sum(loo_iners$ci_low > 1, na.rm = TRUE))
+loo_summary
+```
+
+## Departure from linearity
+
+For Shannon diversity, a linear PSS-4 term is compared with a natural cubic
+spline with 3 degrees of freedom (`ns(pss4_sum, df = 3)`; knots are placed
+automatically). For dominance, a quadratic PSS-4 term is tested using the
+penalized likelihood-ratio P value. These are specification checks.
+
+```{r sens-linearity}
+m_lin    <- lm(shannon_diversity ~ pss4_sum + race + age + stage + hist, data = dat)
+m_spline <- lm(shannon_diversity ~ ns(pss4_sum, df = 3) + race + age + stage + hist,
+               data = dat)
+lin_shannon <- anova(m_lin, m_spline)
+lin_shannon
+
+m_dom_quad <- logistf(
+  lactobacillus_dominance ~ pss4_z + I(pss4_z^2) + race + age + stage + hist,
+  data = dat)
+quad_p <- m_dom_quad$prob[match("I(pss4_z^2)", names(coef(m_dom_quad)))]
+
+linearity_results <- tibble(
+  outcome   = c("Shannon diversity", "Lactobacillus dominance"),
+  test      = c("3-df natural cubic spline vs linear (F test)",
+                "Quadratic PSS-4 term (penalized likelihood ratio)"),
+  statistic = c(lin_shannon$F[2], NA_real_),
+  p_value   = c(lin_shannon$`Pr(>F)`[2], quad_p))
+linearity_results
+```
+
+## Supplementary Table S1
+
+```{r table-s1}
+tableS1 <- bind_rows(
+  species_expanded |>
+    transmute(analysis = paste0("Expanded adjustment: ", outcome), n = nrow(spec),
+              measure = "OR", estimate, conf_low, conf_high, p_value),
+  nohist_results |>
+    transmute(analysis = paste0("Omit histologic subtype: ", outcome), n = nrow(dat),
+              measure = statistic, estimate, conf_low, conf_high, p_value),
+  spearman_result |>
+    transmute(analysis = analysis, n = n, measure = "rho", estimate = rho,
+              conf_low = NA_real_, conf_high = NA_real_, p_value),
+  loo_summary |>
+    transmute(analysis = "Leave-one-out: L. iners detection (OR range)", n = n_refits,
+              measure = "OR range", estimate = NA_real_, conf_low = or_min,
+              conf_high = or_max, p_value = NA_real_),
+  linearity_results |>
+    transmute(analysis = paste0("Departure from linearity: ", outcome), n = nrow(dat),
+              measure = ifelse(is.na(statistic), "-", "F"),
+              estimate = statistic, conf_low = NA_real_, conf_high = NA_real_, p_value)
+)
+tableS1
+```
+
+---
+
+# Export
+
+```{r export}
+output_dir <- params$output_dir
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+writes <- list(
+  "Table1_participant_characteristics.csv"      = table1,
+  "Table2_species_and_community_measures.csv"   = table2,
+  "Table3_race_interaction_and_stratified.csv"  = table3,
+  "SupplementaryTable_S1_sensitivity.csv"       = tableS1,
+  "analytic_event_counts.csv"                   = analysis_counts
+)
+for (nm in names(writes)) readr::write_csv(writes[[nm]], file.path(output_dir, nm))
+
+ggsave(file.path(output_dir, "Figure1.png"), figure1, width = 9,  height = 6.5, dpi = 300)
+ggsave(file.path(output_dir, "Figure2.png"), figure2, width = 10, height = 5,   dpi = 300)
+
+writeLines(capture.output(sessionInfo()), file.path(output_dir, "sessionInfo.txt"))
+cat("Analysis outputs written.\n")
+print(list.files(output_dir))
+```
+
+---
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
