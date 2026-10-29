@@ -1,19 +1,115 @@
-# Vaginal Microbiome Dysbiosis in Ovarian Cancer Patients
+# ORCHiD Vaginal Microbiome Analyses
 
-Analysis code for: **Vaginal Microbiome Composition, Diversity and Dysbiosis: The ORCHiD Study**
+Analysis code for vaginal microbiome composition, dysbiosis, and perceived stress in ovarian cancer patients from the ORCHiD study.
 
-## Overview
+This repository supports two analyses:
+
+- **Vaginal microbiome composition and dysbiosis:** the original topic-modeling analysis of 132 participants, published in *Communications Medicine*.
+- **Perceived stress and vaginal Lactobacillus:** the PSS-4 analysis of 123 participants, described in the manuscript *Perceived Stress and Vaginal Lactobacillus Species Among Patients With Ovarian Cancer in the ORCHiD Study*.
+
+Each analysis has its own inputs, models, and software requirements. Use the instructions in the corresponding section below.
+
+## Perceived stress and vaginal Lactobacillus analysis
+
+### Analysis file
+
+`ORCHiD_PSS4_Microbiome_Analysis_Publish.Rmd`
+
+The R Markdown file contains the stress analysis and its manuscript comparisons. It starts from prepared analysis datasets. Sequencing processing, species assignment, microbiome measures, the PSS-4 total score, and the parent topic model are produced upstream.
+
+### Study and models
+
+- **Analytic sample:** 123 participants: 103 non-Hispanic White and 20 non-Hispanic Black.
+- **Exposure:** PSS-4 total score, standardized using the full analytic sample; estimates are per 1-SD increase (3.43 points).
+- **Species detection:** Firth logistic regression for *L. crispatus*, *L. iners*, *L. gasseri*, and *L. jensenii*, adjusted for race and age. Benjamini–Hochberg correction is applied across these four species tests.
+- **Community and genus measures:** linear regression for Shannon diversity, Firth logistic regression for Lactobacillus dominance, and beta regression for Lactobacillus-dominated topic membership, adjusted for race, age, stage, and histologic subtype.
+- **Race analyses:** age-adjusted interaction models and separate age-adjusted models within each racial group.
+- **Sensitivity analyses:** expanded species adjustment, omission of histologic subtype, Spearman correlation among samples with detected *L. iners*, leave-one-out analysis, and checks for departure from linearity.
+
+P values for community, genus, race, and sensitivity analyses are unadjusted.
+
+### Required inputs
+
+Place these three files in one directory and supply its location through the `data_dir` parameter:
+
+| File | Contents used |
+|---|---|
+| `complete_stress_dysbiosis_dataset.csv` | Participant identifier, PSS-4 total score, age, race, stage, histologic subtype, Shannon diversity, and Lactobacillus dominance |
+| `final_species_enhanced_dataset.csv` | Matching participant identifier, four species-detection indicators, and *L. iners* relative abundance |
+| `topic_model_results.rds` | Parent topic-model output containing a `gamma` table with `document`, `topic`, and `gamma` columns |
+
+The Rmd documents the required column names and coding. These prepared inputs are separate from the metadata supplied for the original dysbiosis analysis.
+
+### Software
+
+The Rmd requires `tidyverse`, `broom`, `logistf`, `betareg`, `patchwork`, and the R-recommended package `splines`. Rendering also requires `rmarkdown`, `knitr`, and Pandoc; RStudio supplies Pandoc.
+
+The original stress-analysis HTML records R 4.6.1, `logistf` 1.26.1, and `betareg` 3.2-6. The Rmd records the environment used for each new run in `sessionInfo.txt`.
+
+Install the CRAN packages before rendering:
+
+```r
+install.packages(c(
+  "tidyverse", "broom", "logistf", "betareg", "patchwork",
+  "rmarkdown", "knitr"
+))
+```
+
+### Running the analysis
+
+From the repository root, with the three prepared input files in `data/`:
+
+```r
+rmarkdown::render(
+  "ORCHiD_PSS4_Microbiome_Analysis_Publish.Rmd",
+  params = list(
+    data_dir = "data",
+    output_dir = "analysis_outputs",
+    fail_on_mismatch = TRUE
+  )
+)
+```
+
+Replace `"data"` with the directory containing the prepared inputs when needed.
+
+### Outputs
+
+The rendered HTML contains the analysis and comparison results. The `analysis_outputs/` directory contains:
+
+- `Table1_participant_characteristics.csv`
+- `Table2_species_and_community_measures.csv`
+- `Table3_race_interaction_and_stratified.csv`
+- `SupplementaryTable_S1_sensitivity.csv`
+- `analytic_event_counts.csv`
+- `check_against_manuscript.csv`
+- `Figure1.png`
+- `Figure2.png`
+- `sessionInfo.txt`
+
+With `fail_on_mismatch = TRUE`, rendering stops if the final verification identifies missing, mismatched, or unexpected results. Inspect `check_against_manuscript.csv` for details.
+
+### Data access
+
+The prepared PSS-4 analysis datasets are not included in this code deposit. For inquiries about access to these inputs, contact April Deveaux at april.deveaux@duke.edu.
+
+Raw sequencing reads are available through NCBI BioProject [PRJNA1414650](https://www.ncbi.nlm.nih.gov/bioproject/PRJNA1414650). Sequencing reads alone do not supply the survey and clinical variables required by the stress analysis.
+
+## Original vaginal microbiome composition and dysbiosis analysis
+
+The instructions below describe the original topic-modeling scripts and their inputs.
+
+### Overview
 
 This repository contains analysis code for characterizing vaginal microbiome composition in post-treatment ovarian cancer patients using 16S rRNA gene sequencing and Latent Dirichlet Allocation (LDA) topic modeling. The study identifies distinct microbial community patterns and their associations with demographic and clinical variables.
 
-## Citation
+### Citation
 
-Deveaux A, et al. (2026). Vaginal Microbiome Composition, Diversity and Dysbiosis: The ORCHiD Study. *Nature Communications Medicine* (in review).
+Deveaux A, Osazuwa-Peters OL, Kim YJ, et al. (2026). Characterizing the composition and diversity of the vaginal microbiome in ovarian cancer. *Communications Medicine*. https://doi.org/10.1038/s43856-026-01771-8
 
-## Repository Contents
+### Repository Contents
 
 ```
-orchid-microbiome-code/
+orchid-microbiome-analysis/
 ├── README.md                              # This file
 ├── 01_topic_model_selection_and_stability.R    # K optimization & stability
 ├── 02_final_lda_model_k7.R                     # Final LDA model fitting
@@ -27,7 +123,7 @@ orchid-microbiome-code/
 
 **Note:** The processed phyloseq object (`ps_filtered.rds`) is not included in this repository due to size and privacy considerations, but is available upon request.
 
-## Study Design
+### Study Design
 
 - **Population:** 132 ovarian cancer patients (post-treatment)
 - **Sample Type:** Self-collected vaginal swabs
@@ -35,17 +131,16 @@ orchid-microbiome-code/
 - **Analysis:** LDA topic modeling with beta regression for associations
 - **Key Covariates:** Age (continuous), race, cancer stage, histologic subtype
 
-## Data Availability
+### Data Availability
 
-### Raw Sequencing Data
+#### Raw Sequencing Data
 Raw FASTQ files are available from the NCBI Sequence Read Archive:
-- **BioProject:** PRJNA[XXXXXX] *(to be added upon data deposition)*
-- **SRA Study:** SRP[XXXXXX] *(to be added upon data deposition)*
+- **BioProject:** PRJNA1414650
 
-### Processed Data
+#### Processed Data
 De-identified sample metadata and processed data tables are available in the manuscript supplementary materials and this repository.
 
-### Study Metadata
+#### Study Metadata
 De-identified sample metadata is available in this repository:
 - **File:** `data/orchid_metadata_deidentified.csv`
 - **Contents:** 
@@ -56,39 +151,39 @@ De-identified sample metadata is available in this repository:
   - Exclusion criteria flags (antibiotic use, vaginal product use)
 - **Note:** All personal identifiers have been removed to protect participant privacy. This metadata file corresponds to the 132 samples included in final analyses after quality filtering.
 
-### Data Not Included in Repository
+#### Data Not Included in Repository
 The following data files are **not included** in this public repository but are available as described:
 - **Processed phyloseq object** (`ps_filtered.rds`): Available upon reasonable request due to file size and data privacy considerations
-- **Raw sequencing data**: Available from NCBI SRA (BioProject PRJNA[XXXXXX])
+- **Raw sequencing data**: Available from NCBI SRA (BioProject PRJNA1414650)
 - **Results files**: Generated locally when running analysis scripts
 
-## Requirements
+### Requirements
 
-### R Version
+#### R Version
 - R version 4.4.0 or higher
 
-### Required R Packages
+#### Required R Packages
 
-#### Topic Modeling
+##### Topic Modeling
 - `topicmodels` (v0.2.17) - LDA implementation
 - `tidytext` (v0.4.3) - Topic model interpretation
 - `ldatuning` (v1.0.2) - Model selection metrics
 
-#### Microbiome Analysis  
+##### Microbiome Analysis  
 - `phyloseq` (v1.48.0) - Microbiome data handling
 - `vegan` (v2.6.4) - Diversity metrics (if needed for other analyses)
 
-#### Statistical Analysis
+##### Statistical Analysis
 - `betareg` (v3.2-4) - Beta regression for proportions
 
-#### Data Manipulation & Visualization
+##### Data Manipulation & Visualization
 - `tidyverse` (v2.0.0) - Data wrangling
 - `ggplot2` (v3.5.2) - Visualization
 - `cowplot` (v1.2.0) - Multi-panel figures
 
 See `session_info.txt` for complete package versions and dependencies.
 
-## Installation
+### Installation
 
 ```r
 # Install CRAN packages
@@ -102,12 +197,12 @@ if (!requireNamespace("BiocManager", quietly = TRUE))
 BiocManager::install(c("phyloseq", "vegan"))
 ```
 
-## Usage
+### Usage
 
-### 1. Data Preparation
+#### 1. Data Preparation
 
 **Option A: Use NCBI data**
-Download raw sequencing data from NCBI SRA (BioProject PRJNA[XXXXXX] once available) and process using DADA2 or your preferred pipeline. The scripts expect a quality-filtered phyloseq object with:
+Download raw sequencing data from NCBI SRA (BioProject PRJNA1414650) and process using DADA2 or your preferred pipeline. The scripts expect a quality-filtered phyloseq object with:
 - Samples with >10,000 reads
 - Taxa with >0.001% relative abundance across all samples
 - Sample metadata including: `Race_clean`, `Stage_clean`, `Histology_clean`, `age_clean`
@@ -118,9 +213,9 @@ Contact the corresponding author for the processed phyloseq object (`ps_filtered
 **Required file location:**
 Save your phyloseq object as `data/ps_filtered.rds` before running analysis scripts.
 
-### 2. Run Analysis Scripts in Order
+#### 2. Run Analysis Scripts in Order
 
-#### Script 1: Topic Model Selection and Stability
+##### Script 1: Topic Model Selection and Stability
 ```r
 source("01_topic_model_selection_and_stability.R")
 ```
@@ -134,7 +229,7 @@ source("01_topic_model_selection_and_stability.R")
 
 **Time:** ~10-15 minutes
 
-#### Script 2: Final LDA Model
+##### Script 2: Final LDA Model
 ```r
 source("02_final_lda_model_k7.R")
 ```
@@ -150,7 +245,7 @@ source("02_final_lda_model_k7.R")
 
 **Time:** ~5 minutes
 
-#### Script 3: Beta Regression Analysis
+##### Script 3: Beta Regression Analysis
 ```r
 source("03_beta_regression_topic_associations.R")
 ```
@@ -164,21 +259,21 @@ source("03_beta_regression_topic_associations.R")
 
 **Time:** <1 minute
 
-### 3. Interpret Results
+#### 3. Interpret Results
 
 Key results files for manuscript:
 1. **Topic characterization:** `topic_reference_guide.csv`
 2. **Topic associations:** `beta_regression_manuscript_table.csv`
 3. **Model validation:** `stability_k7_results.csv`
 
-## Key Analysis Parameters
+### Key Analysis Parameters
 
-### Quality Filtering
+#### Quality Filtering
 - Minimum reads per sample: **10,000**
 - Minimum taxa relative abundance: **0.001%** (1e-5)
 - Final sample size: **132**
 
-### Topic Modeling (LDA)
+#### Topic Modeling (LDA)
 - Method: **Gibbs sampling**
 - Topic range tested: **k = 3-10**
 - Final model: **k = 7**
@@ -187,32 +282,32 @@ Key results files for manuscript:
 - Burn-in: **1000**
 - Thinning: **100**
 
-### Stability Testing
+#### Stability Testing
 - Number of random initializations: **20**
 - Mean beta correlation: **0.883**
 
-### Beta Regression
+#### Beta Regression
 - Link function: **logit**
 - Formula: `Topic_proportion ~ Race_clean + Stage_clean + Histology_clean + age_clean`
 - Multiple testing correction: **Benjamini-Hochberg FDR**
 - Significance threshold: **FDR q < 0.05**
 
-### Variables
+#### Variables
 - **Age:** Continuous (years)
 - **Race:** Non-Hispanic Black (reference) vs Non-Hispanic White
 - **Stage:** Early (I-II, reference) vs Late (III-IV)
 - **Histology:** Type I/non-epithelial (reference) vs Type II epithelial
 
-## Reproducibility Notes
+### Reproducibility Notes
 
 1. **Random Seeds:** All analyses use fixed random seeds for reproducibility
 2. **Package Versions:** See `session_info.txt` for exact versions
 3. **File Paths:** Scripts use relative paths; set working directory to repository root
 4. **Computational Time:** Total runtime ~20 minutes on standard laptop
 
-## Troubleshooting
+### Troubleshooting
 
-### Common Issues
+#### Common Issues
 
 **Error: "Cannot find phyloseq object"**
 - Ensure your processed data is saved as `data/ps_filtered.rds`
@@ -226,26 +321,26 @@ Key results files for manuscript:
 - Install missing packages using installation commands above
 - Some packages require Bioconductor
 
-### Getting Help
+#### Getting Help
 
 For questions about:
 - **Analysis methods:** Contact april.deveaux@duke.edu
 - **Code issues:** Open an issue in this repository
 - **Data access:** See Data Availability section
 
-## License
+### License
 
 This code is released under the MIT License. See LICENSE file for details.
 
-## Acknowledgments
+### Acknowledgments
 
 This work was supported by:
-- National Cancer Institute (K01 CA234320)
+- National Cancer Institute (K01CA255408 and R37CA233777)
 - Duke University Population Health Sciences
 - Duke Microbiome Core Facility
 - State cancer registries (New York, Kentucky, California, North Carolina, Maryland, Georgia, Texas)
 
-## References
+### References
 
 1. **Topic Modeling Approach:** Blei DM, Ng AY, Jordan MI. (2003). Latent Dirichlet allocation. *J Mach Learn Res* 3:993-1022.
 
@@ -255,7 +350,7 @@ This work was supported by:
 
 4. **Phyloseq Package:** McMurdie PJ, Holmes S. (2013). phyloseq: An R package for reproducible interactive analysis and graphics of microbiome census data. *PLoS ONE* 8(4):e61217.
 
-## Contact
+### Contact
 
 **Corresponding Author:**  
 April Deveaux, MD, PhD  
@@ -264,6 +359,6 @@ Duke University School of Medicine
 Durham, NC 27701  
 Email: april.deveaux@duke.edu
 
-## Last Updated
+### Last Updated
 
-January 2026
+October 29, 2026
